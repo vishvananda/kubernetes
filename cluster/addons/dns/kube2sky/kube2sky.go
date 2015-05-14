@@ -75,32 +75,24 @@ func (ks *kube2sky) removeDNS(record string) error {
 	return err
 }
 
-func (ks *kube2sky) addDNS(record string, service *kapi.Service) error {
-	// if PortalIP is not set, a DNS entry should not be created
-	if !kapi.IsServiceIPSet(service) {
-		glog.V(1).Infof("Skipping dns record for headless service: %s\n", service.Name)
-		return nil
+func (ks *kube2sky) addDNS(record string, address string, port int) error {
+	svc := skymsg.Service{
+		Host:     address,
+		Port:     port,
+		Priority: 10,
+		Weight:   10,
+		Ttl:      30,
 	}
+	b, err := json.Marshal(svc)
+	if err != nil {
+		return err
+	}
+	// Set with no TTL, and hope that kubernetes events are accurate.
 
-	for i := range service.Spec.Ports {
-		svc := skymsg.Service{
-			Host:     service.Spec.PortalIP,
-			Port:     service.Spec.Ports[i].Port,
-			Priority: 10,
-			Weight:   10,
-			Ttl:      30,
-		}
-		b, err := json.Marshal(svc)
-		if err != nil {
-			return err
-		}
-		// Set with no TTL, and hope that kubernetes events are accurate.
-
-		glog.V(2).Infof("Setting DNS record: %v -> %s:%d\n", record, service.Spec.PortalIP, service.Spec.Ports[i].Port)
-		_, err = ks.etcdClient.Set(skymsg.Path(record), string(b), uint64(0))
-		if err != nil {
-			return err
-		}
+	glog.V(2).Infof("Setting DNS record: %v -> %s:%d\n", record, address, port)
+	_, err = ks.etcdClient.Set(skymsg.Path(record), string(b), uint64(0))
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -215,15 +207,50 @@ func (ks *kube2sky) createServiceLW() *cache.ListWatch {
 
 func (ks *kube2sky) newService(obj interface{}) {
 	if s, ok := obj.(*kapi.Service); ok {
-		name := ks.buildNameString(s.Name, s.Namespace, ks.domain)
-		ks.mutateEtcdOrDie(func() error { return ks.addDNS(name, s) })
+		ks.mutateEtcdOrDie(func() error {
+			// if PortalIP is not set, a DNS entry should not be created
+			if !kapi.IsServiceIPSet(s) {
+				glog.V(1).Infof("Skipping dns record for headless service: %s\n", s.Name)
+				return nil
+			}
+
+			var err error
+			for i := range s.Spec.Ports {
+				if len(s.Spec.PublicIPs) > 0 {
+					for j := range s.Spec.PublicIPs {
+						name := ks.buildNameString(fmt.Sprintf("%d", j), s.Name, ks.domain)
+						err = ks.addDNS(name, s.Spec.PublicIPs[j], s.Spec.Ports[i].Port)
+						if err != nil {
+							glog.V(1).Infof("Failed to add DNS for %s: %v", name, err)
+						}
+					}
+				}
+				name := ks.buildNameString(s.Name, s.Namespace, ks.domain)
+				err = ks.addDNS(name, s.Spec.PortalIP, s.Spec.Ports[i].Port)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 	}
 }
 
 func (ks *kube2sky) removeService(obj interface{}) {
 	if s, ok := obj.(*kapi.Service); ok {
 		name := ks.buildNameString(s.Name, s.Namespace, ks.domain)
-		ks.mutateEtcdOrDie(func() error { return ks.removeDNS(name) })
+		ks.mutateEtcdOrDie(func() error {
+			if len(s.Spec.PublicIPs) > 0 {
+				for j := range s.Spec.PublicIPs {
+					name := ks.buildNameString(fmt.Sprintf("%d", j), s.Name, ks.domain)
+					err := ks.removeDNS(name)
+					if err != nil {
+						glog.V(1).Infof("Failed to remove DNS for %s: %v", name, err)
+					}
+				}
+			}
+			return ks.removeDNS(name)
+		})
 	}
 }
 
